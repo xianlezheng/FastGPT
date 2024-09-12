@@ -119,6 +119,31 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
     ...props
   } = data;
 
+  // 初始化深度和自动增加深度，避免无限嵌套
+  if (!props.workflowDispatchDeep) {
+    props.workflowDispatchDeep = 1;
+  } else {
+    props.workflowDispatchDeep += 1;
+  }
+
+  if (props.workflowDispatchDeep > 20) {
+    return {
+      flowResponses: [],
+      flowUsages: [],
+      debugResponse: {
+        finishedNodes: [],
+        finishedEdges: [],
+        nextStepRunNodes: []
+      },
+      [DispatchNodeResponseKeyEnum.runTimes]: 1,
+      [DispatchNodeResponseKeyEnum.assistantResponses]: [],
+      [DispatchNodeResponseKeyEnum.toolResponses]: null,
+      newVariables: removeSystemVariable(variables)
+    };
+  }
+
+  let workflowRunTimes = 0;
+
   // set sse response headers
   if (stream && res) {
     res.setHeader('Content-Type', 'text/event-stream;charset=utf-8');
@@ -154,7 +179,8 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
       nodeDispatchUsages,
       toolResponses,
       assistantResponses,
-      rewriteHistories
+      rewriteHistories,
+      runTimes = 1
     }: Omit<
       DispatchNodeResultType<{
         [NodeOutputKeyEnum.answerText]?: string;
@@ -163,6 +189,10 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
       'nodeResponse'
     >
   ) {
+    // Add run times
+    workflowRunTimes += runTimes;
+    props.maxRunTimes -= runTimes;
+
     if (responseData) {
       chatResponses.push(responseData);
     }
@@ -303,10 +333,8 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
     };
   }
 
-  // 每个节点 运行/跳过 后，初始化边的状态
-  function nodeRunAfterHook(node: RuntimeNodeItemType) {
-    node.isEntry = false;
-
+  // 每个节点确定 运行/跳过 前，初始化边的状态
+  function nodeRunBeforeHook(node: RuntimeNodeItemType) {
     runtimeEdges.forEach((item) => {
       if (item.target === node.nodeId) {
         item.status = 'waiting';
@@ -322,7 +350,7 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
     // Thread avoidance
     await surrenderProcess();
 
-    addLog.debug(`Run node`, { maxRunTimes: props.maxRunTimes, uid: user._id });
+    addLog.debug(`Run node`, { maxRunTimes: props.maxRunTimes, appId: props.runningAppInfo.id });
 
     // Get node run status by edges
     const status = checkNodeRunStatus({
@@ -331,11 +359,12 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
     });
     const nodeRunResult = await (() => {
       if (status === 'run') {
-        props.maxRunTimes--;
+        nodeRunBeforeHook(node);
         addLog.debug(`[dispatchWorkFlow] nodeRunWithActive: ${node.name}`);
         return nodeRunWithActive(node);
       }
       if (status === 'skip' && !skippedNodeIdList.has(node.nodeId)) {
+        nodeRunBeforeHook(node);
         props.maxRunTimes -= 0.1;
         skippedNodeIdList.add(node.nodeId);
         addLog.debug(`[dispatchWorkFlow] nodeRunWithSkip: ${node.name}`);
@@ -502,8 +531,6 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
       dispatchRes[item.key] = valueTypeFormat(item.defaultValue, item.valueType);
     });
 
-    nodeRunAfterHook(node);
-
     return {
       node,
       runStatus: 'run',
@@ -520,7 +547,6 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
   }> {
     // Set target edges status to skipped
     const targetEdges = runtimeEdges.filter((item) => item.source === node.nodeId);
-    nodeRunAfterHook(node);
 
     return {
       node,
@@ -535,9 +561,12 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
   const entryNodes = runtimeNodes.filter((item) => item.isEntry);
 
   // reset entry
-  // runtimeNodes.forEach((item) => {
-  //   item.isEntry = false;
-  // });
+  runtimeNodes.forEach((item) => {
+    // Interactive node is not the entry node, return interactive result
+    if (item.flowNodeType !== FlowNodeTypeEnum.userSelect) {
+      item.isEntry = false;
+    }
+  });
   await Promise.all(entryNodes.map((node) => checkNodeCanRun(node)));
 
   // focus try to run pluginOutput
@@ -565,6 +594,7 @@ export async function dispatchWorkFlow(data: Props): Promise<DispatchFlowRespons
       finishedEdges: runtimeEdges,
       nextStepRunNodes: debugNextStepRunNodes
     },
+    [DispatchNodeResponseKeyEnum.runTimes]: workflowRunTimes,
     [DispatchNodeResponseKeyEnum.assistantResponses]:
       mergeAssistantResponseAnswerText(chatAssistantResponse),
     [DispatchNodeResponseKeyEnum.toolResponses]: toolRunResponse,
